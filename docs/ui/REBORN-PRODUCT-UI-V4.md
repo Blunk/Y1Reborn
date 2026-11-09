@@ -442,7 +442,8 @@ felt buzzy on the owner's player). Light is 2.0 V, Strong the stock 2.8 V.
 
 Internal speaker (#28 speaker): Settings > Sound > Output > **Speaker** (on by default, as stock's
 "Speaker"). The Headphone Jack output plays on the speaker while the kernel reads the jack empty
-(`reborn_platform::jack`, "Y2Audio Headphone" SW events; unknown counts as headphones). The output's
+(`reborn_platform::jack`: the card's ALSA "Headphone Jack" control and its change events; unreadable counts
+as headphones). The output's
 name then reads "Speaker". The DAC's speaker route plays one channel, so the gain stage mixes (L+R)/2
 (`VolumeRamp::mono`); the sink switches the card's Speaker pin with Master −3 dB (stock's top speaker
 step). Headphones in while the speaker plays: the kernel turns the speaker off at once and playback
