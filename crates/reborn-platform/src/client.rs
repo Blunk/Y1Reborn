@@ -778,8 +778,7 @@ pub fn update(status: &Value, ota_enabled: bool) -> UpdateState {
     // failed update (download.json) supersedes it: otherwise the page kept
     // saying "didn't finish" and never offered the newer release.
     let failure = u.failure().unwrap_or("");
-    let superseded =
-        failure.contains("cancelled") || downloading(&["Checking", "Checked", "Staging"]);
+    let superseded = owner_cancelled(failure) || downloading(&["Checking", "Checked", "Staging"]);
     let phase = match state {
         "Queued" => UpdatePhase::ReadyToInstall,
         "PendingHealth" => UpdatePhase::Installing,
@@ -1484,6 +1483,12 @@ fn diagnostics(s: &Value, caps: &Value) -> Vec<DiagnosticSection> {
     out
 }
 
+/// A failure the owner chose: Cancel Update (the core records the queue as `Failed` with "owner cancelled
+/// before installation") or a cancelled download.
+fn owner_cancelled(failure: &str) -> bool {
+    failure.contains("cancelled")
+}
+
 /// Reduce an explicit operation's record to public facts.
 fn operation(r: &Value) -> OperationResult {
     let mut facts = vec![];
@@ -1524,7 +1529,10 @@ fn operation(r: &Value) -> OperationResult {
         facts.push(fact("DNS ready", &r["wifi"]["dns_ready"]));
     }
     OperationResult {
-        succeeded: r["record"]["result"] != "FAILED" && r["state"] != "Failed",
+        // Cancel Update answers with the journal it left, `Failed` by the owner's choice: that is the
+        // cancel done, not "The operation did not finish".
+        succeeded: r["record"]["result"] != "FAILED"
+            && (r["state"] != "Failed" || r["failure"].as_str().is_some_and(owner_cancelled)),
         facts,
     }
 }
@@ -2184,6 +2192,11 @@ mod feature_completion_tests {
     fn export_failure_is_not_reported_as_complete_and_retrieval_is_explained() {
         let failed = operation(&json!({"state":"Failed","failure":"disk_full"}));
         assert!(!failed.succeeded);
+        // Cancel Update's answer (the core's journal after the owner's cancel) is the cancel done.
+        let cancelled = operation(&json!({"state":"Failed","sequence":16002,
+            "failure":"owner cancelled before installation"}));
+        assert!(cancelled.succeeded);
+        assert!(!operation(&json!({"state":"Failed","failure":null})).succeeded);
         let success = operation(
             &json!({"state":"Complete","redacted":true,"path":"/data/exports/report.tar.gz"}),
         );
