@@ -1,4 +1,5 @@
-//! FM radio: the MT6627 tuner of the Y2's connectivity chip (Y2Linux Beta 8).
+//! FM radio: the MT6627 tuner of the connectivity chip (Y2Linux Beta 8; the Y1's MT6572 has the same
+//! tuner, with the same sysfs interface and capture name).
 //!
 //! The kernel owns the chip (`/sys/devices/platform/18070000.connectivity/fm`:
 //! `power`, `frequency` in kHz, `signal`, `scan`, `state`); the tuner's sound
@@ -42,15 +43,22 @@ pub enum Availability {
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub sysfs: PathBuf,
-    pub firmware: PathBuf,
+    /// Where the kernel may find the tuner's two files; FM is ready when one of them holds both.
+    pub firmware: Vec<PathBuf>,
     pub pcm: PathBuf,
     pub arecord: PathBuf,
 }
+/// Where the kernel finds the tuner's files: the Y2's firmware directory and the Y1's (its kernel
+/// reads `/data/firmware`, the radio firmware in `mt6572`). Both are looked at: a Y1 may also have
+/// a `mt6582` directory without the pair, left from its bring-up.
+const FIRMWARE: [&str; 2] = ["/lib/firmware/mediatek/mt6582", "/data/firmware/mt6572"];
+const FIRMWARE_FILES: [&str; 2] = ["mt6627_fm_v1_patch.bin", "mt6627_fm_v1_coeff.bin"];
+
 impl Default for Paths {
     fn default() -> Self {
         Self {
             sysfs: "/sys/devices/platform/18070000.connectivity/fm".into(),
-            firmware: "/lib/firmware/mediatek/mt6582".into(),
+            firmware: FIRMWARE.iter().map(PathBuf::from).collect(),
             pcm: "/proc/asound/pcm".into(),
             arecord: ARECORD.into(),
         }
@@ -140,10 +148,12 @@ impl Paths {
         if !self.sysfs.join("power").exists() {
             return Availability::NoTuner;
         }
-        let present = ["mt6627_fm_v1_patch.bin", "mt6627_fm_v1_coeff.bin"]
-            .iter()
-            .all(|n| fs::metadata(self.firmware.join(n)).is_ok_and(|m| m.is_file() && m.len() > 0));
-        if present {
+        let holds_pair = |directory: &PathBuf| {
+            FIRMWARE_FILES
+                .iter()
+                .all(|n| fs::metadata(directory.join(n)).is_ok_and(|m| m.is_file() && m.len() > 0))
+        };
+        if self.firmware.iter().any(holds_pair) {
             Availability::Ready
         } else {
             Availability::NeedsFirmware
@@ -209,7 +219,8 @@ impl Paths {
         self.write("scan", "0")
     }
     /// The ALSA device of the tuner's capture, from /proc/asound/pcm
-    /// ("00-02: Y2 FM Capture … : capture 1").
+    /// ("00-02: Y2 FM Capture … : capture 1"; the Y1's link is named after its CPU DAI:
+    /// "00-01: Y2 FM Capture-dir-hifi dir-hifi-1 :  : capture 1").
     pub fn capture_device(&self) -> Option<String> {
         let text = fs::read_to_string(&self.pcm).ok()?;
         text.lines().find_map(|line| {
@@ -375,12 +386,14 @@ mod tests {
     fn fake(root: &Path) -> Paths {
         let p = Paths {
             sysfs: root.join("fm"),
-            firmware: root.join("firmware"),
+            firmware: vec![root.join("elsewhere"), root.join("firmware")],
             pcm: root.join("pcm"),
             arecord: root.join("arecord"),
         };
         fs::create_dir_all(&p.sysfs).unwrap();
-        fs::create_dir_all(&p.firmware).unwrap();
+        for directory in &p.firmware {
+            fs::create_dir_all(directory).unwrap();
+        }
         p
     }
 
@@ -391,9 +404,14 @@ mod tests {
         assert_eq!(p.availability(), Availability::NoTuner);
         fs::write(p.sysfs.join("power"), "0\n").unwrap();
         assert_eq!(p.availability(), Availability::NeedsFirmware);
-        fs::write(p.firmware.join("mt6627_fm_v1_patch.bin"), [1; 1028]).unwrap();
+        fs::write(p.firmware[1].join("mt6627_fm_v1_patch.bin"), [1; 1028]).unwrap();
         assert_eq!(p.availability(), Availability::NeedsFirmware);
-        fs::write(p.firmware.join("mt6627_fm_v1_coeff.bin"), [1; 1092]).unwrap();
+        // Half the pair in another directory does not complete it.
+        fs::write(p.firmware[0].join("mt6627_fm_v1_coeff.bin"), [1; 1092]).unwrap();
+        assert_eq!(p.availability(), Availability::NeedsFirmware);
+        // The first directory exists without the pair (a Y1's leftover mt6582): the second counts.
+        fs::remove_file(p.firmware[0].join("mt6627_fm_v1_coeff.bin")).unwrap();
+        fs::write(p.firmware[1].join("mt6627_fm_v1_coeff.bin"), [1; 1092]).unwrap();
         assert_eq!(p.availability(), Availability::Ready);
     }
 
@@ -439,6 +457,13 @@ mod tests {
         assert_eq!(p.capture_device().as_deref(), Some("hw:0,2"));
         fs::write(&p.pcm, "00-00: Y2 Headphone Playback (*) :  : playback 1\n").unwrap();
         assert_eq!(p.capture_device(), None);
+        // The Y1's link, named after its CPU DAI.
+        fs::write(
+            &p.pcm,
+            "00-01: Y2 FM Capture-dir-hifi dir-hifi-1 :  : capture 1\n",
+        )
+        .unwrap();
+        assert_eq!(p.capture_device().as_deref(), Some("hw:0,1"));
     }
 
     #[test]
@@ -469,7 +494,7 @@ mod tests {
         let p = fake(dir.path());
         fs::write(p.sysfs.join("power"), "0\n").unwrap();
         for n in ["mt6627_fm_v1_patch.bin", "mt6627_fm_v1_coeff.bin"] {
-            fs::write(p.firmware.join(n), [1; 8]).unwrap();
+            fs::write(p.firmware[1].join(n), [1; 8]).unwrap();
         }
         fs::write(&p.pcm, "00-02: Y2 FM Capture x :  : capture 1\n").unwrap();
         // A stand-in arecord: records its arguments, writes a few bytes.
@@ -507,7 +532,7 @@ mod tests {
         std::thread::sleep(POWER_GRACE + Duration::from_millis(400));
         assert_eq!(fs::read_to_string(p.sysfs.join("power")).unwrap(), "0");
         assert!(Stream::start_with(p.clone(), "https://x").is_err());
-        fs::remove_file(p.firmware.join("mt6627_fm_v1_coeff.bin")).unwrap();
+        fs::remove_file(p.firmware[1].join("mt6627_fm_v1_coeff.bin")).unwrap();
         assert!(Stream::start_with(p, "fm:98100").is_err());
     }
 }
